@@ -27,6 +27,7 @@ class Nile(BaseANN):
     # We assume a pre-existing database with the extension registered
     # Nile currently does not support COPY, so we will use batch insertions
     # Nile currently does not support storage parameters, so we rely on pgvector's default
+    # TODO: Actual batch insertions, or at least don't commit after each row
     # TODO: add log table for tracking various test runs and execution times
     def fit(self, X: numpy.array):
         print("connecting to database..." + self._connection_string)
@@ -36,29 +37,16 @@ class Nile(BaseANN):
         cur.execute("DROP TABLE IF EXISTS items")
         cur.execute("CREATE TABLE items (id int, embedding vector(%d))" % X.shape[1])
         print("inserting data...")
-        batches: list[numpy.array] = None
-        if X.shape[0] < self.BATCH_SIZE:
-            batches = [X]
-        else:
-            splits = [x for x in range(0, X.shape[0], self.BATCH_SIZE)][1:]
-            batches = numpy.split(X, splits)
-        print(f"Loading {X.shape[0]} embeddings into table using {len(batches)} batches")
-        start_idx = 0
-        for i in range(0, len(batches)):
-            batch = batches[i]
-            query = "INSERT INTO items(id, embedding) VALUES (%s, %s)"
-            # Create list of (id, embedding) tuples
-            values = [(start_idx + j, embedding.tolist()) 
-                     for j, embedding in enumerate(batch)]
-            start_idx += len(batch)
+        print(f"Loading {X.shape[0]} embeddings into table")
+        query = "INSERT INTO items(id, embedding) VALUES (%s, %s)"
+        for i, embedding in enumerate(X):
             try:
-                print(f"Inserting {len(values)} rows")
-                cur.executemany(query, values)
-                print(f"Inserted {len(values)} rows")
+                cur.execute(query, (i, embedding.tolist()))
             except Exception as e:
                 print(e)
                 conn.rollback()
                 break
+        print(f"Inserted {X.shape[0]} rows")
         print("creating index...")
         if self._metric == "angular":
             cur.execute(
