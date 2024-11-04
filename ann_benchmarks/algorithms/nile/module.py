@@ -8,7 +8,7 @@ from ..base.module import BaseANN
 
 class Nile(BaseANN):
     
-    BATCH_SIZE = 1000
+    BATCH_SIZE = 10 # need to tune this
     
     def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int):
         self._metric = metric
@@ -30,12 +30,11 @@ class Nile(BaseANN):
     # TODO: add log table for tracking various test runs and execution times
     def fit(self, X: numpy.array):
         print("connecting to database..." + self._connection_string)
-        conn = psycopg.connect(self._connection_string)
+        conn = psycopg.connect(self._connection_string, autocommit=True)
         pgvector.psycopg.register_vector(conn)
         cur = conn.cursor()
         cur.execute("DROP TABLE IF EXISTS items")
         cur.execute("CREATE TABLE items (id int, embedding vector(%d))" % X.shape[1])
-        conn.commit()
         print("inserting data...")
         batches: list[numpy.array] = None
         if X.shape[0] < self.BATCH_SIZE:
@@ -44,13 +43,18 @@ class Nile(BaseANN):
             splits = [x for x in range(0, X.shape[0], self.BATCH_SIZE)][1:]
             batches = numpy.split(X, splits)
         print(f"Loading {X.shape[0]} embeddings into table using {len(batches)} batches")
+        start_idx = 0
         for i in range(0, len(batches)):
             batch = batches[i]
-            query = "INSERT INTO items(id, embedding) VALUES %%s";
+            query = "INSERT INTO items(id, embedding) VALUES (%s, %s)"
+            # Create list of (id, embedding) tuples
+            values = [(start_idx + j, embedding.tolist()) 
+                     for j, embedding in enumerate(batch)]
+            start_idx += len(batch)
             try:
-                cur.executemany(query, batch)
-                print(f"Inserted {i + len(batch)} rows")
-                conn.commit() # commit after each batch
+                print(f"Inserting {len(values)} rows")
+                cur.executemany(query, values)
+                print(f"Inserted {len(values)} rows")
             except Exception as e:
                 print(e)
                 conn.rollback()
