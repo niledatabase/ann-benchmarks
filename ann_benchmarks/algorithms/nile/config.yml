@@ -1,0 +1,17 @@
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: Nile
+    disabled: false
+    docker_tag: ann-benchmarks-nile
+    module: ann_benchmarks.algorithms.nile
+    name: nile
+    run_groups:
+      nile:
+        # TODO: add more args - depends on what we want to test
+        args: [
+          ["postgresql://postgres:postgres@localhost:5432/postgres"], # connection string
+          [16], # m
+          [64], # ef_construction
+        ]
+        query_args: [[100]] # ef_search

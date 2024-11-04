@@ -274,7 +274,7 @@ def run_from_cmdline():
     parser.add_argument("build", help='JSON of arguments to pass to the constructor. E.g. ["angular", 100]')
     parser.add_argument("queries", help="JSON of arguments to pass to the queries. E.g. [100]", nargs="*", default=[])
     args = parser.parse_args()
-
+    print(args)
     algo_args = json.loads(args.build)
     print(algo_args)
     query_args = [json.loads(q) for q in args.queries]
