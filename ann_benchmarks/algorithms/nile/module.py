@@ -1,4 +1,3 @@
-import pgvector.psycopg
 import psycopg
 from psycopg import sql
 import numpy
@@ -87,7 +86,7 @@ class Nile(BaseANN):
         print(f"Inserted {X.shape[0]} rows")
         
     def _set_tenant_context(self, cursor, tenant_id) -> None:
-        if self.tenant_aware:
+        if self.IS_TENANT_AWARE:
             cursor.execute(
                 sql.SQL(""" set local nile.tenant_id = {} """).format(
                     sql.Literal(tenant_id)
@@ -116,17 +115,14 @@ class Nile(BaseANN):
     # Nile currently does not support storage parameters, so we rely on pgvector's default
     # TODO: Actual batch insertions, or at least don't commit after each row
     # TODO: add log table for tracking various test runs and execution times
-    # TODO: Make setup optional
     def fit(self, X: numpy.array):
         print("connecting to database..." + self._connection_string)
         conn = psycopg.connect(self._connection_string, autocommit=True)
-        pgvector.psycopg.register_vector(conn)
         cur = conn.cursor()
-        self._create_table(cur, X.shape[1])
-        conn.commit()
-        self._insert_data(cur, conn, X)
-        self._create_index(cur)
-        conn.commit()
+        if not self._existing_table:    
+            self._create_table(cur, X.shape[1])
+            self._insert_data(cur, conn, X)
+            self._create_index(cur)
         print("done!")
         self._cur = cur
 
@@ -137,8 +133,9 @@ class Nile(BaseANN):
     def query(self, v, n):
         self._set_tenant_context(self._cur, self.TENANT_ID)
         query = sql.SQL(self._query).format(limit=sql.Literal(n))
-        self._cur.execute(query, {"query_embedding": v}, binary=False, prepare=False)
-        return [id for id, in self._cur.fetchall()]
+        text_vec = str(v.tolist())
+        self._cur.execute(query, {"query_embedding": text_vec}, binary=False, prepare=False)
+        return [id for id,distance in self._cur.fetchall()]
 
     def get_memory_usage(self) -> Optional[float]:
         return psutil.Process().memory_info().rss / 1024
