@@ -17,6 +17,7 @@ class Nile(BaseANN):
         self._m = m
         self._ef_construction = ef_construction
         self._existing_table = existing_table
+        self._ef_search = 40 # default, it can be overridden by the query arguments
         self._cur = None
 
         if metric == "angular":
