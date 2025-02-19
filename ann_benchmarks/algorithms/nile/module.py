@@ -1,4 +1,5 @@
 import psycopg
+import pgvector.psycopg
 from psycopg import sql
 import numpy
 import psutil
@@ -85,14 +86,6 @@ class Nile(BaseANN):
         # Commit any remaining rows
         conn.commit()
         print(f"Inserted {X.shape[0]} rows")
-        
-    def _set_tenant_context(self, cursor, tenant_id) -> None:
-        if self.IS_TENANT_AWARE:
-            cursor.execute(
-                sql.SQL(""" set local nile.tenant_id = {} """).format(
-                    sql.Literal(tenant_id)
-                )
-            )
 
     def _create_index(self, cur):
         print("creating index...")
@@ -119,7 +112,15 @@ class Nile(BaseANN):
     def fit(self, X: numpy.array):
         print("connecting to database..." + self._connection_string)
         conn = psycopg.connect(self._connection_string, autocommit=True)
+        pgvector.psycopg.register_vector(conn)
         cur = conn.cursor()
+        # Set tenant context once here, to avoid setting it for each query
+        if self.IS_TENANT_AWARE:
+            cur.execute(
+                sql.SQL(""" set nile.tenant_id = {} """).format(
+                    sql.Literal(self.TENANT_ID)
+                )
+            )
         if not self._existing_table:    
             self._create_table(cur, X.shape[1])
             self._insert_data(cur, conn, X)
@@ -132,11 +133,9 @@ class Nile(BaseANN):
         self._cur.execute("SET hnsw.ef_search = %d" % ef_search)
 
     def query(self, v, n):
-        self._set_tenant_context(self._cur, self.TENANT_ID)
         query = sql.SQL(self._query).format(limit=sql.Literal(n))
-        text_vec = str(v.tolist())
-        self._cur.execute(query, {"query_embedding": text_vec}, binary=False, prepare=False)
-        return [id for id,distance in self._cur.fetchall()]
+        self._cur.execute(query, {"query_embedding": v}, binary=True, prepare=False)
+        return [id for id, distance in self._cur.fetchall()]
 
     def get_memory_usage(self) -> Optional[float]:
         return psutil.Process().memory_info().rss / 1024
