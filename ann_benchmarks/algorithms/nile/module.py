@@ -11,10 +11,10 @@ from ..base.module import BaseANN
 class Nile(BaseANN):
     BATCH_SIZE = 1000 # need to tune this
     MULTI_ROW_INSERT_SIZE = 100
-    IS_TENANT_AWARE = True # TODO: make this configurable
+    # IS_TENANT_AWARE is now configurable via the constructor
     NUM_TENANTS = 50
     
-    def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int, existing_table: bool = False):
+    def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int, existing_table: bool = False, table_name: str = "items", is_tenant_aware: bool = True):
         self._metric = metric
         self._connection_string = connection_string
         self._m = m
@@ -23,6 +23,8 @@ class Nile(BaseANN):
         self._ef_search = 40 # default, it can be overridden by the query arguments
         self._cur = None
         self._query_count = 0
+        self._table_name = table_name
+        self.IS_TENANT_AWARE = is_tenant_aware
 
         if self.IS_TENANT_AWARE:
             self._tenant_ids = [str(uuid.uuid4()) for _ in range(self.NUM_TENANTS)]
@@ -30,9 +32,9 @@ class Nile(BaseANN):
             self._other_tenant_ids = self._tenant_ids[1:]
 
         if metric == "angular":
-            self._query = "SELECT id, %(query_embedding)s::vector<=>embedding as distance FROM items ORDER BY distance LIMIT {limit}"
+            self._query = f"SELECT id, %(query_embedding)s::vector<=>embedding as distance FROM {table_name} ORDER BY distance LIMIT {{limit}}"
         elif metric == "euclidean":
-            self._query = "SELECT id, %(query_embedding)s::vector<->embedding as distance FROM items ORDER BY distance LIMIT {limit}"
+            self._query = f"SELECT id, %(query_embedding)s::vector<->embedding as distance FROM {table_name} ORDER BY distance LIMIT {{limit}}"
         else:
             raise RuntimeError(f"unknown metric {metric}")
         
@@ -44,22 +46,22 @@ class Nile(BaseANN):
 
     def _create_shared_table(self, cur, dimensions):
         print("creating table...")
-        cur.execute("DROP INDEX IF EXISTS items_embedding_idx") # needed because Nile doesn't support CASCADE
-        cur.execute("DROP TABLE IF EXISTS items")
-        cur.execute("CREATE TABLE items (id int, embedding vector(%d))" % dimensions)
-        cur.execute("ALTER TABLE items ALTER COLUMN embedding SET STORAGE PLAIN")
+        cur.execute(f"DROP INDEX IF EXISTS {self._table_name}_embedding_idx") # needed because Nile doesn't support CASCADE
+        cur.execute(f"DROP TABLE IF EXISTS {self._table_name}")
+        cur.execute(f"CREATE TABLE {self._table_name} (id int, embedding vector(%d))" % dimensions)
+        cur.execute(f"ALTER TABLE {self._table_name} ALTER COLUMN embedding SET STORAGE PLAIN")
         
     def _create_tenant_aware_table(self, cur, conn,dimensions):
         print("creating table...")
         try:
-            cur.execute("DROP INDEX IF EXISTS items_embedding_idx") # needed because Nile doesn't support CASCADE
+            cur.execute(f"DROP INDEX IF EXISTS {self._table_name}_embedding_idx") # needed because Nile doesn't support CASCADE
         except Exception as e:
             print(e) # ignore if index doesn't exist, this is a workaround for THE-2303
             
         try:
-            cur.execute("DROP TABLE IF EXISTS items")
-            cur.execute("CREATE TABLE items (id int, tenant_id uuid, embedding vector(%d))" % dimensions) 
-            cur.execute("ALTER TABLE items ALTER COLUMN embedding SET STORAGE PLAIN")
+            cur.execute(f"DROP TABLE IF EXISTS {self._table_name}")
+            cur.execute(f"CREATE TABLE {self._table_name} (id int, tenant_id uuid, embedding vector(%d))" % dimensions) 
+            cur.execute(f"ALTER TABLE {self._table_name} ALTER COLUMN embedding SET STORAGE PLAIN")
         except Exception as e:
             print(e)
             raise e
@@ -118,7 +120,7 @@ class Nile(BaseANN):
                                 continue
 
                             values_template = ", ".join(["(%s, %s, %s)"] * len(chunk_indices))
-                            query = sql.SQL("INSERT INTO items (id, tenant_id, embedding) VALUES {}").format(sql.SQL(values_template))
+                            query = sql.SQL(f"INSERT INTO {self._table_name} (id, tenant_id, embedding) VALUES {{}}" ).format(sql.SQL(values_template))
                             
                             params = []
                             for idx in chunk_indices:
@@ -155,7 +157,7 @@ class Nile(BaseANN):
                             continue
 
                         values_template = ", ".join(["(%s, %s)"] * num_in_chunk)
-                        query = sql.SQL("INSERT INTO items (id, embedding) VALUES {}").format(sql.SQL(values_template))
+                        query = sql.SQL(f"INSERT INTO {self._table_name} (id, embedding) VALUES {{}}" ).format(sql.SQL(values_template))
                         
                         params = []
                         for k in range(chunk_start_idx, chunk_end_idx):
@@ -178,16 +180,15 @@ class Nile(BaseANN):
         print("creating index...")
         if self._metric == "angular":
             cur.execute(
-                """
-                with s as (select set_config('statement_timeout', '30 min', true)) select * from s;
-                CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops) WITH (m = %d, ef_construction = %d)
+                f"""
+                CREATE INDEX {self._table_name}_embedding_idx ON {self._table_name} USING hnsw (embedding vector_cosine_ops) WITH (m = %d, ef_construction = %d)
                 """ % (self._m, self._ef_construction)
             )
         elif self._metric == "euclidean":
-            cur.execute("""
-                        with s as (select set_config('statement_timeout', '30 min', true)) select * from s;
-                        CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = %d, ef_construction = %d)
-                        """ % (self._m, self._ef_construction))
+            cur.execute(
+                f"""
+                CREATE INDEX {self._table_name}_embedding_idx ON {self._table_name} USING hnsw (embedding vector_l2_ops) WITH (m = %d, ef_construction = %d)
+                """ % (self._m, self._ef_construction))
         else:
             raise RuntimeError(f"unknown metric {self._metric}")
 
