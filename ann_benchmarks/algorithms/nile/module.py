@@ -35,9 +35,9 @@ class Nile(BaseANN):
         else:
             raise RuntimeError(f"unknown metric {metric}")
         
-    def _create_table(self, cur, dimensions):
+    def _create_table(self, cur, conn, dimensions):
         if self.IS_TENANT_AWARE:
-            self._create_tenant_aware_table(cur, dimensions)
+            self._create_tenant_aware_table(cur, conn, dimensions)
         else:
             self._create_shared_table(cur, dimensions)
 
@@ -48,7 +48,7 @@ class Nile(BaseANN):
         cur.execute("CREATE TABLE items (id int, embedding vector(%d))" % dimensions)
         cur.execute("ALTER TABLE items ALTER COLUMN embedding SET STORAGE PLAIN")
         
-    def _create_tenant_aware_table(self, cur, dimensions):
+    def _create_tenant_aware_table(self, cur, conn,dimensions):
         print("creating table...")
         try:
             cur.execute("DROP INDEX IF EXISTS items_embedding_idx") # needed because Nile doesn't support CASCADE
@@ -64,9 +64,12 @@ class Nile(BaseANN):
             raise e
             
         try:
-            # Use executemany for efficient bulk insertion of tenants
             tenants_to_insert = [(tenant_id, f"tenant_{i}") for i, tenant_id in enumerate(self._tenant_ids)]
-            cur.executemany("INSERT INTO tenants(id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING", tenants_to_insert)
+            conn.commit() # DML operations on tenants table have to be first in transaction
+            # Nile requires each tenant insert to be in a separate transaction
+            for i, tenant_id in enumerate(self._tenant_ids):
+                cur.execute("INSERT INTO tenants(id, name) VALUES (%s, %s)", (tenant_id, f"tenant_{i}"))
+                conn.commit()
         except Exception as e:
             print(f"Error during tenant insertion: {e}") # Log other errors if any
             # If ON CONFLICT is not supported or another error occurs, this might need specific handling
@@ -156,7 +159,7 @@ class Nile(BaseANN):
         cur = conn.cursor()
         
         if not self._existing_table:    
-            self._create_table(cur, X.shape[1])
+            self._create_table(cur, conn, X.shape[1])
             conn.commit() # Commit DDL changes for table creation
             
             self._insert_data(cur, conn, X) # This method will handle its own batch commits/rollbacks
