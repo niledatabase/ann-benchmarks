@@ -10,6 +10,7 @@ from ..base.module import BaseANN
 
 class Nile(BaseANN):
     BATCH_SIZE = 1000 # need to tune this
+    MULTI_ROW_INSERT_SIZE = 100
     IS_TENANT_AWARE = True # TODO: make this configurable
     NUM_TENANTS = 50
     
@@ -97,8 +98,6 @@ class Nile(BaseANN):
                 tenant_id = random.choice(self._other_tenant_ids)
                 tenant_data[tenant_id].append(vector_idx)
 
-            query = "INSERT INTO items(id, tenant_id, embedding) VALUES (%s, %s, %s)"
-            
             inserted_count = 0
             # Iterate through each tenant and insert their data in batches
             for tenant_id, vector_indices in tenant_data.items():
@@ -110,21 +109,26 @@ class Nile(BaseANN):
 
                 for i in range(0, num_vectors_for_tenant, self.BATCH_SIZE):
                     batch_indices = vector_indices[i:i + self.BATCH_SIZE]
-                    current_batch_data = [(idx, tenant_id, X[idx]) for idx in batch_indices]
-                    
-                    if not current_batch_data:
-                        continue
                     
                     try:
-                        print(f"  Inserting batch of {len(current_batch_data)} vectors for tenant {tenant_id}")
-                        ## Error with executemany after attempting to flush the first batch: "psycopg.DatabaseError: Invalid messaging sequence. Message type H not presently allowed"
-                        ## cur.executemany(query, current_batch_data)
-                        # Insert one by one
-                        for idx, tenant_id, vector in current_batch_data:
-                            cur.execute(query, (idx, tenant_id, vector))
-                        # Commit after each batch
+                        # Process the batch in smaller chunks using multi-row INSERTs
+                        for j in range(0, len(batch_indices), self.MULTI_ROW_INSERT_SIZE):
+                            chunk_indices = batch_indices[j:j + self.MULTI_ROW_INSERT_SIZE]
+                            if not chunk_indices:
+                                continue
+
+                            values_template = ", ".join(["(%s, %s, %s)"] * len(chunk_indices))
+                            query = sql.SQL("INSERT INTO items (id, tenant_id, embedding) VALUES {}").format(sql.SQL(values_template))
+                            
+                            params = []
+                            for idx in chunk_indices:
+                                params.extend([idx, tenant_id, X[idx]])
+
+                            print(f"  Inserting multi-row chunk of {len(chunk_indices)} vectors for tenant {tenant_id}")
+                            cur.execute(query, params)
+
                         conn.commit()
-                        inserted_count += len(current_batch_data)
+                        inserted_count += len(batch_indices)
                         print(f"  Total inserted rows: {inserted_count}/{total_rows}")
                     except Exception as e:
                         print(f"Error inserting batch for tenant {tenant_id}: {e}")
@@ -132,19 +136,33 @@ class Nile(BaseANN):
                         print(f"Aborting insertion due to error. {inserted_count} rows were inserted before the error.")
                         return # Stop further insertions
         else:
+            # Non-tenant-aware insertion logic
             print(f"Loading {total_rows} embeddings with {X.shape[1]} dimensions into table")
-            query = "INSERT INTO items(id, embedding) VALUES (%s, %s)"
-
+            
             inserted_count = 0
-            for batch_start_idx in range(0, total_rows, self.BATCH_SIZE):
-                batch_end_idx = min(batch_start_idx + self.BATCH_SIZE, total_rows)
-                current_batch_data = [(i, X[i]) for i in range(batch_start_idx, batch_end_idx)]
+            for i in range(0, total_rows, self.BATCH_SIZE):
+                batch_start_idx = i
+                batch_end_idx = min(i + self.BATCH_SIZE, total_rows)
                 
-                if not current_batch_data:
-                    continue
-
                 try:
-                    cur.executemany(query, current_batch_data)
+                    # Process the batch in smaller chunks using multi-row INSERTs
+                    for j in range(batch_start_idx, batch_end_idx, self.MULTI_ROW_INSERT_SIZE):
+                        chunk_start_idx = j
+                        chunk_end_idx = min(j + self.MULTI_ROW_INSERT_SIZE, batch_end_idx)
+                        num_in_chunk = chunk_end_idx - chunk_start_idx
+
+                        if num_in_chunk == 0:
+                            continue
+
+                        values_template = ", ".join(["(%s, %s)"] * num_in_chunk)
+                        query = sql.SQL("INSERT INTO items (id, embedding) VALUES {}").format(sql.SQL(values_template))
+                        
+                        params = []
+                        for k in range(chunk_start_idx, chunk_end_idx):
+                            params.extend([k, X[k]])
+                        
+                        cur.execute(query, params)
+
                     conn.commit()
                     inserted_count = batch_end_idx
                     print(f"Inserted {inserted_count}/{total_rows} rows")
