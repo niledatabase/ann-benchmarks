@@ -232,7 +232,7 @@ class Nile(BaseANN):
                 else: # Subsequent blocks are for randomly chosen tenants.
                     tenant_id_to_set = random.choice(self._other_tenant_ids)
                 
-                self._cur.execute(sql.SQL("set nile.tenant_id = {}").format(sql.Literal(tenant_id_to_set)))
+                self._cur.execute(sql.SQL("commit; set nile.tenant_id = {}").format(sql.Literal(tenant_id_to_set)))
 
         query = sql.SQL(self._query).format(limit=sql.Literal(n))
         self._cur.execute(query, {"query_embedding": v}, binary=True, prepare=False)
