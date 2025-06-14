@@ -11,10 +11,23 @@ from ..base.module import BaseANN
 class Nile(BaseANN):
     BATCH_SIZE = 1000 # need to tune this
     MULTI_ROW_INSERT_SIZE = 100
-    # IS_TENANT_AWARE is now configurable via the constructor
     NUM_TENANTS = 50
     
-    def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int, existing_table: bool = False, table_name: str = "items", is_tenant_aware: bool = True):
+    
+    def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int, existing_table: bool = False, table_name: str = "items", is_tenant_aware: bool = True, insert_as_text: bool = False):
+        """
+        Initialize the Nile ANN class.
+
+        Parameters:
+            metric (str): The distance metric to use ('angular' or 'euclidean').
+            connection_string (str): PostgreSQL connection string for the database.
+            m (int): HNSW parameter for the number of bi-directional links created for every new element during construction.
+            ef_construction (int): HNSW parameter controlling index construction accuracy/speed tradeoff.
+            existing_table (bool, optional): If True, use an existing table instead of creating a new one. Default is False.
+            table_name (str, optional): Name of the table to use or create. Default is 'items'.
+            is_tenant_aware (bool, optional): If True, enables tenant-aware mode (multi-tenant table and logic). Default is True.
+            insert_as_text (bool, optional): If True, inserts vectors as text (string) instead of binary (numpy array). Useful for debugging or compatibility issues. Default is False (binary).
+        """
         self._metric = metric
         self._connection_string = connection_string
         self._m = m
@@ -25,6 +38,7 @@ class Nile(BaseANN):
         self._query_count = 0
         self._table_name = table_name
         self.IS_TENANT_AWARE = is_tenant_aware
+        self._insert_as_text = insert_as_text
 
         if self.IS_TENANT_AWARE:
             self._tenant_ids = [str(uuid.uuid4()) for _ in range(self.NUM_TENANTS)]
@@ -124,7 +138,12 @@ class Nile(BaseANN):
                             
                             params = []
                             for idx in chunk_indices:
-                                params.extend([idx, tenant_id, X[idx]])
+                                if self._insert_as_text:
+                                    # Convert numpy array to pgvector-compatible string
+                                    vector_str = "[" + ",".join(map(str, X[idx])) + "]"
+                                    params.extend([idx, tenant_id, vector_str])
+                                else:
+                                    params.extend([idx, tenant_id, X[idx]])
 
                             print(f"  Inserting multi-row chunk of {len(chunk_indices)} vectors for tenant {tenant_id}")
                             cur.execute(query, params)
@@ -161,7 +180,11 @@ class Nile(BaseANN):
                         
                         params = []
                         for k in range(chunk_start_idx, chunk_end_idx):
-                            params.extend([k, X[k]])
+                            if self._insert_as_text:
+                                vector_str = "[" + ",".join(map(str, X[k])) + "]"
+                                params.extend([k, vector_str])
+                            else:
+                                params.extend([k, X[k]])
                         
                         cur.execute(query, params)
 
