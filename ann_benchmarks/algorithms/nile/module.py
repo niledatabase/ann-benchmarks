@@ -258,7 +258,12 @@ class Nile(BaseANN):
                 self._cur.execute(sql.SQL("commit; set nile.tenant_id = {}").format(sql.Literal(tenant_id_to_set)))
 
         query = sql.SQL(self._query).format(limit=sql.Literal(n))
-        self._cur.execute(query, {"query_embedding": v}, binary=True, prepare=False)
+        if self._insert_as_text:
+            # Convert query vector to pgvector-compatible string
+            v_str = "[" + ",".join(map(str, v)) + "]"
+            self._cur.execute(query, {"query_embedding": v_str}, binary=False, prepare=False)
+        else:
+            self._cur.execute(query, {"query_embedding": v}, binary=True, prepare=False)
         return [id for id, distance in self._cur.fetchall()]
 
     def get_memory_usage(self) -> Optional[float]:
