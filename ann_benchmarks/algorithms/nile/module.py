@@ -14,7 +14,7 @@ class Nile(BaseANN):
     NUM_TENANTS = 50
     
     
-    def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int, existing_table: bool = False, table_name: str = "items", is_tenant_aware: bool = True, insert_as_text: bool = False):
+    def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int, existing_table: bool = False, table_name: str = "items", is_tenant_aware: bool = True, insert_as_text: bool = False, num_tenants: int = 50):
         """
         Initialize the Nile ANN class.
 
@@ -27,6 +27,7 @@ class Nile(BaseANN):
             table_name (str, optional): Name of the table to use or create. Default is 'items'.
             is_tenant_aware (bool, optional): If True, enables tenant-aware mode (multi-tenant table and logic). Default is True.
             insert_as_text (bool, optional): If True, inserts vectors as text (string) instead of binary (numpy array). Useful for debugging or compatibility issues. Default is False (binary).
+            num_tenants (int, optional): Number of tenants to use in tenant-aware mode. Default is 50.
         """
         self._metric = metric
         self._connection_string = connection_string
@@ -39,6 +40,7 @@ class Nile(BaseANN):
         self._table_name = table_name
         self.IS_TENANT_AWARE = is_tenant_aware
         self._insert_as_text = insert_as_text
+        self.NUM_TENANTS = num_tenants
 
         if self.IS_TENANT_AWARE:
             self._tenant_ids = [str(uuid.uuid4()) for _ in range(self.NUM_TENANTS)]
@@ -98,44 +100,22 @@ class Nile(BaseANN):
         if self.IS_TENANT_AWARE:
             print(f"Loading {total_rows} embeddings with {X.shape[1]} dimensions into table for {self.NUM_TENANTS} tenants")
 
-            # Partition data among tenants by creating a map of tenant_id -> [vector_indices]
-            indices = numpy.arange(total_rows)
-            numpy.random.shuffle(indices)
-            
-            large_tenant_count = int(total_rows * 0.3)
-            
-            tenant_data = {tenant_id: [] for tenant_id in self._tenant_ids}
-            
-            # Assign first 30% of shuffled indices to the large tenant
-            tenant_data[self._large_tenant_id].extend(indices[:large_tenant_count])
-            
-            # Assign the rest of shuffled indices randomly to other tenants
-            for vector_idx in indices[large_tenant_count:]:
-                tenant_id = random.choice(self._other_tenant_ids)
-                tenant_data[tenant_id].append(vector_idx)
-
             inserted_count = 0
-            # Iterate through each tenant and insert their data in batches
-            for tenant_id, vector_indices in tenant_data.items():
-                if not vector_indices:
-                    continue
-                
-                num_vectors_for_tenant = len(vector_indices)
-                print(f"Inserting {num_vectors_for_tenant} vectors for tenant {tenant_id}...")
-
-                for i in range(0, num_vectors_for_tenant, self.BATCH_SIZE):
-                    batch_indices = vector_indices[i:i + self.BATCH_SIZE]
-                    
+            # For each tenant, insert the entire dataset
+            for tenant_id in self._tenant_ids:
+                print(f"Inserting {total_rows} vectors for tenant {tenant_id}...")
+                for i in range(0, total_rows, self.BATCH_SIZE):
+                    batch_indices = range(i, min(i + self.BATCH_SIZE, total_rows))
                     try:
                         # Process the batch in smaller chunks using multi-row INSERTs
                         for j in range(0, len(batch_indices), self.MULTI_ROW_INSERT_SIZE):
-                            chunk_indices = batch_indices[j:j + self.MULTI_ROW_INSERT_SIZE]
+                            chunk_indices = list(batch_indices)[j:j + self.MULTI_ROW_INSERT_SIZE]
                             if not chunk_indices:
                                 continue
 
                             values_template = ", ".join(["(%s, %s, %s)"] * len(chunk_indices))
                             query = sql.SQL(f"INSERT INTO {self._table_name} (id, tenant_id, embedding) VALUES {{}}" ).format(sql.SQL(values_template))
-                            
+
                             params = []
                             for idx in chunk_indices:
                                 if self._insert_as_text:
@@ -150,12 +130,13 @@ class Nile(BaseANN):
 
                         conn.commit()
                         inserted_count += len(batch_indices)
-                        print(f"  Total inserted rows: {inserted_count}/{total_rows}")
+                        print(f"  Total inserted rows for tenant {tenant_id}: {inserted_count}/{total_rows}")
                     except Exception as e:
                         print(f"Error inserting batch for tenant {tenant_id}: {e}")
                         conn.rollback()
-                        print(f"Aborting insertion due to error. {inserted_count} rows were inserted before the error.")
-                        return # Stop further insertions
+                        print(f"Aborting insertion for tenant {tenant_id} due to error. {inserted_count} rows were inserted before the error.")
+                        return # Stop further insertions for this tenant
+                inserted_count = 0  # Reset for next tenant
         else:
             # Non-tenant-aware insertion logic
             print(f"Loading {total_rows} embeddings with {X.shape[1]} dimensions into table")
