@@ -106,36 +106,45 @@ class Nile(BaseANN):
                 print(f"Inserting {total_rows} vectors for tenant {tenant_id}...")
                 for i in range(0, total_rows, self.BATCH_SIZE):
                     batch_indices = range(i, min(i + self.BATCH_SIZE, total_rows))
-                    try:
-                        # Process the batch in smaller chunks using multi-row INSERTs
-                        for j in range(0, len(batch_indices), self.MULTI_ROW_INSERT_SIZE):
-                            chunk_indices = list(batch_indices)[j:j + self.MULTI_ROW_INSERT_SIZE]
-                            if not chunk_indices:
-                                continue
+                    
+                    retries = 3
+                    while retries > 0:
+                        try:
+                            # Process the batch in smaller chunks using multi-row INSERTs
+                            for j in range(0, len(batch_indices), self.MULTI_ROW_INSERT_SIZE):
+                                chunk_indices = list(batch_indices)[j:j + self.MULTI_ROW_INSERT_SIZE]
+                                if not chunk_indices:
+                                    continue
 
-                            values_template = ", ".join(["(%s, %s, %s)"] * len(chunk_indices))
-                            query = sql.SQL(f"INSERT INTO {self._table_name} (id, tenant_id, embedding) VALUES {{}}" ).format(sql.SQL(values_template))
+                                values_template = ", ".join(["(%s, %s, %s)"] * len(chunk_indices))
+                                query = sql.SQL(f"INSERT INTO {self._table_name} (id, tenant_id, embedding) VALUES {{}}" ).format(sql.SQL(values_template))
 
-                            params = []
-                            for idx in chunk_indices:
-                                if self._insert_as_text:
-                                    # Convert numpy array to pgvector-compatible string
-                                    vector_str = "[" + ",".join(map(str, X[idx])) + "]"
-                                    params.extend([idx, tenant_id, vector_str])
-                                else:
-                                    params.extend([idx, tenant_id, X[idx]])
+                                params = []
+                                for idx in chunk_indices:
+                                    if self._insert_as_text:
+                                        # Convert numpy array to pgvector-compatible string
+                                        vector_str = "[" + ",".join(map(str, X[idx])) + "]"
+                                        params.extend([idx, tenant_id, vector_str])
+                                    else:
+                                        params.extend([idx, tenant_id, X[idx]])
 
-                            print(f"  Inserting multi-row chunk of {len(chunk_indices)} vectors for tenant {tenant_id}")
-                            cur.execute(query, params)
+                                print(f"  Inserting multi-row chunk of {len(chunk_indices)} vectors for tenant {tenant_id}")
+                                # Can't use prepared statements due to a known issue with Nile
+                                cur.execute(query, params, prepare=False)
 
-                        conn.commit()
-                        inserted_count += len(batch_indices)
-                        print(f"  Total inserted rows for tenant {tenant_id}: {inserted_count}/{total_rows}")
-                    except Exception as e:
-                        print(f"Error inserting batch for tenant {tenant_id}: {e}")
-                        conn.rollback()
-                        print(f"Aborting insertion for tenant {tenant_id} due to error. {inserted_count} rows were inserted before the error.")
-                        return # Stop further insertions for this tenant
+                            conn.commit()
+                            inserted_count += len(batch_indices)
+                            print(f"  Total inserted rows for tenant {tenant_id}: {inserted_count}/{total_rows}")
+                            break # Success, exit retry loop
+                        except Exception as e:
+                            conn.rollback()
+                            retries -= 1
+                            print(f"Error inserting batch for tenant {tenant_id}: {e}")
+                            if retries > 0:
+                                print(f"Retrying batch... ({retries} retries left)")
+                            else:
+                                print(f"Aborting insertion for tenant {tenant_id} due to error. {inserted_count} rows were inserted before the error.")
+                                return # Stop further insertions for this tenant
                 inserted_count = 0  # Reset for next tenant
         else:
             # Non-tenant-aware insertion logic
@@ -146,37 +155,44 @@ class Nile(BaseANN):
                 batch_start_idx = i
                 batch_end_idx = min(i + self.BATCH_SIZE, total_rows)
                 
-                try:
-                    # Process the batch in smaller chunks using multi-row INSERTs
-                    for j in range(batch_start_idx, batch_end_idx, self.MULTI_ROW_INSERT_SIZE):
-                        chunk_start_idx = j
-                        chunk_end_idx = min(j + self.MULTI_ROW_INSERT_SIZE, batch_end_idx)
-                        num_in_chunk = chunk_end_idx - chunk_start_idx
+                retries = 3
+                while retries > 0:
+                    try:
+                        # Process the batch in smaller chunks using multi-row INSERTs
+                        for j in range(batch_start_idx, batch_end_idx, self.MULTI_ROW_INSERT_SIZE):
+                            chunk_start_idx = j
+                            chunk_end_idx = min(j + self.MULTI_ROW_INSERT_SIZE, batch_end_idx)
+                            num_in_chunk = chunk_end_idx - chunk_start_idx
 
-                        if num_in_chunk == 0:
-                            continue
+                            if num_in_chunk == 0:
+                                continue
 
-                        values_template = ", ".join(["(%s, %s)"] * num_in_chunk)
-                        query = sql.SQL(f"INSERT INTO {self._table_name} (id, embedding) VALUES {{}}" ).format(sql.SQL(values_template))
-                        
-                        params = []
-                        for k in range(chunk_start_idx, chunk_end_idx):
-                            if self._insert_as_text:
-                                vector_str = "[" + ",".join(map(str, X[k])) + "]"
-                                params.extend([k, vector_str])
-                            else:
-                                params.extend([k, X[k]])
-                        
-                        cur.execute(query, params)
+                            values_template = ", ".join(["(%s, %s)"] * num_in_chunk)
+                            query = sql.SQL(f"INSERT INTO {self._table_name} (id, embedding) VALUES {{}}" ).format(sql.SQL(values_template))
+                            
+                            params = []
+                            for k in range(chunk_start_idx, chunk_end_idx):
+                                if self._insert_as_text:
+                                    vector_str = "[" + ",".join(map(str, X[k])) + "]"
+                                    params.extend([k, vector_str])
+                                else:
+                                    params.extend([k, X[k]])
+                            
+                            cur.execute(query, params, prepare=False)
 
-                    conn.commit()
-                    inserted_count = batch_end_idx
-                    print(f"Inserted {inserted_count}/{total_rows} rows")
-                except Exception as e:
-                    print(f"Error inserting batch starting at row {batch_start_idx}: {e}")
-                    conn.rollback()
-                    print(f"Aborting insertion due to error. {inserted_count} rows were inserted before the error.")
-                    return # Stop further insertions
+                        conn.commit()
+                        inserted_count = batch_end_idx
+                        print(f"Inserted {inserted_count}/{total_rows} rows")
+                        break # Success, exit retry loop
+                    except Exception as e:
+                        conn.rollback()
+                        retries -= 1
+                        print(f"Error inserting batch starting at row {batch_start_idx}: {e}")
+                        if retries > 0:
+                             print(f"Retrying batch... ({retries} retries left)")
+                        else:
+                            print(f"Aborting insertion due to error. {inserted_count} rows were inserted before the error.")
+                            return # Stop further insertions
 
         print(f"Successfully inserted all {total_rows} rows.")
 
