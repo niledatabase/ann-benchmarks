@@ -14,7 +14,7 @@ class Nile(BaseANN):
     NUM_TENANTS = 50
     
     
-    def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int, existing_table: bool = False, table_name: str = "items", is_tenant_aware: bool = True, insert_as_text: bool = False, num_tenants: int = 50):
+    def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int, existing_table: bool = False, table_name: str = "items", is_tenant_aware: bool = True, insert_as_text: bool = False, num_tenants: int = 50, compute_id: str = None):
         """
         Initialize the Nile ANN class.
 
@@ -28,6 +28,7 @@ class Nile(BaseANN):
             is_tenant_aware (bool, optional): If True, enables tenant-aware mode (multi-tenant table and logic). Default is True.
             insert_as_text (bool, optional): If True, inserts vectors as text (string) instead of binary (numpy array). Useful for debugging or compatibility issues. Default is False (binary).
             num_tenants (int, optional): Number of tenants to use in tenant-aware mode. Default is 50.
+            compute_id (str, optional): The ID of the compute resources to use for tenants. Default is None.
         """
         self._metric = metric
         self._connection_string = connection_string
@@ -41,6 +42,7 @@ class Nile(BaseANN):
         self.IS_TENANT_AWARE = is_tenant_aware
         self._insert_as_text = insert_as_text
         self.NUM_TENANTS = num_tenants
+        self._compute_id = compute_id
 
         if self.IS_TENANT_AWARE:
             self._tenant_ids = [str(uuid.uuid4()) for _ in range(self.NUM_TENANTS)]
@@ -87,7 +89,10 @@ class Nile(BaseANN):
             conn.commit() # DML operations on tenants table have to be first in transaction
             # Nile requires each tenant insert to be in a separate transaction
             for i, tenant_id in enumerate(self._tenant_ids):
-                cur.execute("INSERT INTO tenants(id, name) VALUES (%s, %s)", (tenant_id, f"tenant_{i}"))
+                if self._compute_id:
+                    cur.execute("INSERT INTO tenants(id, name, compute_id) VALUES (%s, %s, %s)", (tenant_id, f"tenant_{i}", self._compute_id))
+                else:
+                    cur.execute("INSERT INTO tenants(id, name) VALUES (%s, %s)", (tenant_id, f"tenant_{i}"))
                 conn.commit()
         except Exception as e:
             print(f"Error during tenant insertion: {e}") # Log other errors if any
@@ -103,6 +108,10 @@ class Nile(BaseANN):
             inserted_count = 0
             # For each tenant, insert the entire dataset
             for tenant_id in self._tenant_ids:
+                # Add a small amount of random noise to the dataset for each tenant
+                noise = numpy.random.normal(loc=0.0, scale=1e-5, size=X.shape).astype(X.dtype)
+                X_tenant = X + noise
+                
                 print(f"Inserting {total_rows} vectors for tenant {tenant_id}...")
                 for i in range(0, total_rows, self.BATCH_SIZE):
                     batch_indices = range(i, min(i + self.BATCH_SIZE, total_rows))
@@ -123,10 +132,10 @@ class Nile(BaseANN):
                                 for idx in chunk_indices:
                                     if self._insert_as_text:
                                         # Convert numpy array to pgvector-compatible string
-                                        vector_str = "[" + ",".join(map(str, X[idx])) + "]"
+                                        vector_str = "[" + ",".join(map(str, X_tenant[idx])) + "]"
                                         params.extend([idx, tenant_id, vector_str])
                                     else:
-                                        params.extend([idx, tenant_id, X[idx]])
+                                        params.extend([idx, tenant_id, X_tenant[idx]])
 
                                 print(f"  Inserting multi-row chunk of {len(chunk_indices)} vectors for tenant {tenant_id}")
                                 # Can't use prepared statements due to a known issue with Nile
@@ -270,5 +279,7 @@ class Nile(BaseANN):
         s = f"Nile(m={self._m}, ef_construction={self._ef_construction}, ef_search={self._ef_search}"
         if self.IS_TENANT_AWARE:
             s += f", tenants={self.NUM_TENANTS}"
+        if self._compute_id:
+            s += f", compute_id={self._compute_id}"
         s += ")"
         return s
