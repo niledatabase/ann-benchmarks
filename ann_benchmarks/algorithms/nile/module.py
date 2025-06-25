@@ -286,8 +286,8 @@ class Nile(BaseANN):
         self._cur.execute("SET hnsw.ef_search = %d" % ef_search)
         # using strict_order to avoid modifying the query and using CTE
         self._cur.execute("SET hnsw.iterative_scan = strict_order;")
-        self._cur.execute("SET hnsw.max_scan_tuples = 1000000;")
-        self._cur.execute("SET hnsw.scan_mem_multiplier = 4;")
+        self._cur.execute("SET hnsw.max_scan_tuples = 10000000;")
+        self._cur.execute("SET hnsw.scan_mem_multiplier = 1000;")
 
     def query(self, v, n):
         if self.IS_TENANT_AWARE:
@@ -297,6 +297,7 @@ class Nile(BaseANN):
                 tenant_id_to_set = random.choice(self._tenant_ids)
                 self._cur.execute("commit;")
                 self._cur.execute(f"set nile.tenant_id = '{tenant_id_to_set}'")
+                self.set_query_arguments(self._ef_search)
 
         query = sql.SQL(self._query).format(limit=sql.Literal(n))
         if self._insert_as_text:
