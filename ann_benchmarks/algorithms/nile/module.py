@@ -1,3 +1,32 @@
+# This module defines the Nile class, which is an implementation of the BaseANN interface
+# for the Nile database (a serverless Postgres designed for SaaS).
+#
+# The main responsibilities of the key methods are as follows:
+#
+# - __init__: Initializes the Nile instance with connection details, HNSW parameters,
+#             and options for tenant awareness and data insertion formats.
+#
+# - fit: Connects to the database and prepares it for queries. This includes:
+#   - Creating a table (either shared or tenant-aware) if it doesn't exist.
+#   - Creating tenants if needed, picking them up if the table already exists.
+#   - Inserting the vector data in batches.
+#   - Creating an HNSW index on the embeddings.
+#
+# - query: Executes a k-NN search. For tenant-aware configurations, it also
+#          handles switching the tenant context periodically.
+#
+# - set_query_arguments: Configures the `ef_search` parameter for HNSW queries to
+#                        control the trade-off between search speed and accuracy.
+#
+# Helper methods for 'fit':
+# - _create_table: Dispatches table creation to tenant-aware or shared versions.
+# - _create_shared_table: Creates a simple table for embeddings.
+# - _create_tenant_aware_table: Creates a multi-tenant table.
+# - _create_tenants: Registers tenants for multi-tenant scenarios.
+# - _insert_data: Manages batch insertion of data with retry logic, supporting both
+#                 shared and tenant-aware schemas.
+# - _create_index: Builds the HNSW index on the vector column.
+
 import psycopg
 import pgvector.psycopg
 from psycopg import sql
@@ -43,11 +72,7 @@ class Nile(BaseANN):
         self._insert_as_text = insert_as_text
         self.NUM_TENANTS = num_tenants
         self._compute_id = compute_id
-
-        if self.IS_TENANT_AWARE:
-            self._tenant_ids = [str(uuid.uuid4()) for _ in range(self.NUM_TENANTS)]
-            self._large_tenant_id = self._tenant_ids[0]
-            self._other_tenant_ids = self._tenant_ids[1:]
+        self._tenant_ids = []
 
         if metric == "angular":
             self._query = f"SELECT id, %(query_embedding)s::vector<=>embedding as distance FROM {table_name} ORDER BY distance LIMIT {{limit}}"
@@ -58,7 +83,7 @@ class Nile(BaseANN):
         
     def _create_table(self, cur, conn, dimensions):
         if self.IS_TENANT_AWARE:
-            self._create_tenant_aware_table(cur, conn, dimensions)
+            self._create_tenant_aware_table(cur, dimensions)
         else:
             self._create_shared_table(cur, dimensions)
 
@@ -69,7 +94,7 @@ class Nile(BaseANN):
         cur.execute(f"CREATE TABLE {self._table_name} (id int, embedding vector(%d))" % dimensions)
         cur.execute(f"ALTER TABLE {self._table_name} ALTER COLUMN embedding SET STORAGE PLAIN")
         
-    def _create_tenant_aware_table(self, cur, conn,dimensions):
+    def _create_tenant_aware_table(self, cur, dimensions):
         print("creating table...")
         try:
             cur.execute(f"DROP INDEX IF EXISTS {self._table_name}_embedding_idx") # needed because Nile doesn't support CASCADE
@@ -83,8 +108,10 @@ class Nile(BaseANN):
         except Exception as e:
             print(e)
             raise e
-            
+        
+    def _create_tenants(self, cur, conn):
         try:
+            self._tenant_ids = [str(uuid.uuid4()) for _ in range(self.NUM_TENANTS)]
             tenants_to_insert = [(tenant_id, f"tenant_{i}") for i, tenant_id in enumerate(self._tenant_ids)]
             conn.commit() # DML operations on tenants table have to be first in transaction
             # Nile requires each tenant insert to be in a separate transaction
@@ -97,113 +124,105 @@ class Nile(BaseANN):
         except Exception as e:
             print(f"Error during tenant insertion: {e}") # Log other errors if any
             # If ON CONFLICT is not supported or another error occurs, this might need specific handling
+            
+    def _get_existing_tenants(self, cur, conn):
+        """
+        Fetch the most recently created tenants from the tenants table.
+        Populates self._tenant_ids with the most recent NUM_TENANTS tenant IDs.
+        """
+        try:
+            cur.execute(
+                "SELECT id FROM tenants ORDER BY created DESC LIMIT %s", (self.NUM_TENANTS,)
+            )
+            rows = cur.fetchall()
+            self._tenant_ids = [row[0] for row in rows]
+            print(f"Fetched {len(self._tenant_ids)} existing tenants.")
+        except Exception as e:
+            print(f"Error fetching existing tenants: {e}")
+
+    def _insert_batch(self, cur, conn, X, columns, get_params_for_row, log_prefix=""):
+        total_rows = X.shape[0]
+        inserted_count = 0
+        
+        for i in range(0, total_rows, self.BATCH_SIZE):
+            batch_indices = range(i, min(i + self.BATCH_SIZE, total_rows))
+            
+            retries = 3
+            while retries > 0:
+                try:
+                    for j in range(0, len(batch_indices), self.MULTI_ROW_INSERT_SIZE):
+                        chunk_indices = list(batch_indices)[j:j + self.MULTI_ROW_INSERT_SIZE]
+                        if not chunk_indices:
+                            continue
+
+                        values_template = ", ".join([f"({', '.join(['%s'] * len(columns))})"] * len(chunk_indices))
+                        column_names = ", ".join(columns)
+                        query = sql.SQL(f"INSERT INTO {self._table_name} ({column_names}) VALUES {{}}").format(sql.SQL(values_template))
+                        
+                        params = []
+                        for idx in chunk_indices:
+                            params.extend(get_params_for_row(X[idx], idx))
+
+                        if log_prefix:
+                            print(f"{log_prefix} Inserting multi-row chunk of {len(chunk_indices)} vectors")
+                        cur.execute(query, params, prepare=False)
+                    
+                    conn.commit()
+                    inserted_count += len(batch_indices)
+                    print(f"{log_prefix} Inserted {inserted_count}/{total_rows} rows")
+                    break # Success, exit retry loop
+                except Exception as e:
+                    conn.rollback()
+                    retries -= 1
+                    print(f"{log_prefix} Error inserting batch: {e}")
+                    if retries > 0:
+                        print(f"{log_prefix} Retrying batch... ({retries} retries left)")
+                    else:
+                        print(f"{log_prefix} Aborting insertion due to error. {inserted_count} rows were inserted before the error.")
+                        return False
+        return True
+
+    def _insert_data_tenant_aware(self, cur, conn, X):
+        print(f"Loading {X.shape[0]} embeddings with {X.shape[1]} dimensions into table for {self.NUM_TENANTS} tenants")
+        for tenant_id in self._tenant_ids:
+            noise = numpy.random.normal(loc=0.0, scale=1e-5, size=X.shape).astype(X.dtype)
+            X_tenant = X + noise
+            
+            def get_params(row, index):
+                if self._insert_as_text:
+                    vector_str = "[" + ",".join(map(str, row)) + "]"
+                    return [index, tenant_id, vector_str]
+                else:
+                    return [index, tenant_id, row]
+
+            print(f"Inserting {X.shape[0]} vectors for tenant {tenant_id}...")
+            success = self._insert_batch(cur, conn, X_tenant, ["id", "tenant_id", "embedding"], get_params, log_prefix=f"  Tenant {tenant_id[:8]}:")
+            if not success:
+                print(f"Aborting insertion for tenant {tenant_id} due to error.")
+                return # Stop further insertions for this tenant
+    
+    def _insert_data_shared(self, cur, conn, X):
+        print(f"Loading {X.shape[0]} embeddings with {X.shape[1]} dimensions into table")
+        
+        def get_params(row, index):
+            if self._insert_as_text:
+                vector_str = "[" + ",".join(map(str, row)) + "]"
+                return [index, vector_str]
+            else:
+                return [index, row]
+        
+        success = self._insert_batch(cur, conn, X, ["id", "embedding"], get_params)
+        if not success:
+            print("Aborting insertion due to error.")
 
     def _insert_data(self, cur, conn, X):
         print("inserting data...")
-        total_rows = X.shape[0]
-
         if self.IS_TENANT_AWARE:
-            print(f"Loading {total_rows} embeddings with {X.shape[1]} dimensions into table for {self.NUM_TENANTS} tenants")
-
-            inserted_count = 0
-            # For each tenant, insert the entire dataset
-            for tenant_id in self._tenant_ids:
-                # Add a small amount of random noise to the dataset for each tenant
-                noise = numpy.random.normal(loc=0.0, scale=1e-5, size=X.shape).astype(X.dtype)
-                X_tenant = X + noise
-                
-                print(f"Inserting {total_rows} vectors for tenant {tenant_id}...")
-                for i in range(0, total_rows, self.BATCH_SIZE):
-                    batch_indices = range(i, min(i + self.BATCH_SIZE, total_rows))
-                    
-                    retries = 3
-                    while retries > 0:
-                        try:
-                            # Process the batch in smaller chunks using multi-row INSERTs
-                            for j in range(0, len(batch_indices), self.MULTI_ROW_INSERT_SIZE):
-                                chunk_indices = list(batch_indices)[j:j + self.MULTI_ROW_INSERT_SIZE]
-                                if not chunk_indices:
-                                    continue
-
-                                values_template = ", ".join(["(%s, %s, %s)"] * len(chunk_indices))
-                                query = sql.SQL(f"INSERT INTO {self._table_name} (id, tenant_id, embedding) VALUES {{}}" ).format(sql.SQL(values_template))
-
-                                params = []
-                                for idx in chunk_indices:
-                                    if self._insert_as_text:
-                                        # Convert numpy array to pgvector-compatible string
-                                        vector_str = "[" + ",".join(map(str, X_tenant[idx])) + "]"
-                                        params.extend([idx, tenant_id, vector_str])
-                                    else:
-                                        params.extend([idx, tenant_id, X_tenant[idx]])
-
-                                print(f"  Inserting multi-row chunk of {len(chunk_indices)} vectors for tenant {tenant_id}")
-                                # Can't use prepared statements due to a known issue with Nile
-                                cur.execute(query, params, prepare=False)
-
-                            conn.commit()
-                            inserted_count += len(batch_indices)
-                            print(f"  Total inserted rows for tenant {tenant_id}: {inserted_count}/{total_rows}")
-                            break # Success, exit retry loop
-                        except Exception as e:
-                            conn.rollback()
-                            retries -= 1
-                            print(f"Error inserting batch for tenant {tenant_id}: {e}")
-                            if retries > 0:
-                                print(f"Retrying batch... ({retries} retries left)")
-                            else:
-                                print(f"Aborting insertion for tenant {tenant_id} due to error. {inserted_count} rows were inserted before the error.")
-                                return # Stop further insertions for this tenant
-                inserted_count = 0  # Reset for next tenant
+            self._insert_data_tenant_aware(cur, conn, X)
         else:
-            # Non-tenant-aware insertion logic
-            print(f"Loading {total_rows} embeddings with {X.shape[1]} dimensions into table")
-            
-            inserted_count = 0
-            for i in range(0, total_rows, self.BATCH_SIZE):
-                batch_start_idx = i
-                batch_end_idx = min(i + self.BATCH_SIZE, total_rows)
-                
-                retries = 3
-                while retries > 0:
-                    try:
-                        # Process the batch in smaller chunks using multi-row INSERTs
-                        for j in range(batch_start_idx, batch_end_idx, self.MULTI_ROW_INSERT_SIZE):
-                            chunk_start_idx = j
-                            chunk_end_idx = min(j + self.MULTI_ROW_INSERT_SIZE, batch_end_idx)
-                            num_in_chunk = chunk_end_idx - chunk_start_idx
+            self._insert_data_shared(cur, conn, X)
 
-                            if num_in_chunk == 0:
-                                continue
-
-                            values_template = ", ".join(["(%s, %s)"] * num_in_chunk)
-                            query = sql.SQL(f"INSERT INTO {self._table_name} (id, embedding) VALUES {{}}" ).format(sql.SQL(values_template))
-                            
-                            params = []
-                            for k in range(chunk_start_idx, chunk_end_idx):
-                                if self._insert_as_text:
-                                    vector_str = "[" + ",".join(map(str, X[k])) + "]"
-                                    params.extend([k, vector_str])
-                                else:
-                                    params.extend([k, X[k]])
-                            
-                            cur.execute(query, params, prepare=False)
-
-                        conn.commit()
-                        inserted_count = batch_end_idx
-                        print(f"Inserted {inserted_count}/{total_rows} rows")
-                        break # Success, exit retry loop
-                    except Exception as e:
-                        conn.rollback()
-                        retries -= 1
-                        print(f"Error inserting batch starting at row {batch_start_idx}: {e}")
-                        if retries > 0:
-                             print(f"Retrying batch... ({retries} retries left)")
-                        else:
-                            print(f"Aborting insertion due to error. {inserted_count} rows were inserted before the error.")
-                            return # Stop further insertions
-
-        print(f"Successfully inserted all {total_rows} rows.")
+        print(f"Successfully finished inserting data.")
 
     def _create_index(self, cur):
         print("creating index...")
@@ -236,12 +255,15 @@ class Nile(BaseANN):
         
         if not self._existing_table:    
             self._create_table(cur, conn, X.shape[1])
+            self._create_tenants(cur, conn)
             conn.commit() # Commit DDL changes for table creation
             
             self._insert_data(cur, conn, X) # This method will handle its own batch commits/rollbacks
             
             self._create_index(cur)
             conn.commit() # Commit DDL changes for index creation
+        else:
+            self._get_existing_tenants(cur, conn)
         print("done!")
         # The connection cursor is set up. Tenant context for queries will be set within the query method.
         self._cur = cur
@@ -255,12 +277,7 @@ class Nile(BaseANN):
             self._query_count += 1
             # Switch tenant context every 200 queries.
             if (self._query_count - 1) % 200 == 0:
-                # The first block of queries (1-200) is for the large tenant.
-                if self._query_count == 1:
-                    tenant_id_to_set = self._large_tenant_id
-                else: # Subsequent blocks are for randomly chosen tenants.
-                    tenant_id_to_set = random.choice(self._other_tenant_ids)
-                
+                tenant_id_to_set = random.choice(self._tenant_ids)
                 self._cur.execute(sql.SQL("commit; set nile.tenant_id = {}").format(sql.Literal(tenant_id_to_set)))
 
         query = sql.SQL(self._query).format(limit=sql.Literal(n))
