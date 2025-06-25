@@ -274,6 +274,7 @@ class Nile(BaseANN):
         self._cur.execute("SET hnsw.ef_search = %d" % ef_search)
         # using strict_order to avoid modifying the query and using CTE
         self._cur.execute("SET hnsw.iterative_scan = strict_order;")
+        self._cur.execute("SET hnsw.max_scan_tuples = 40000;")
 
     def query(self, v, n):
         if self.IS_TENANT_AWARE:
