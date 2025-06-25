@@ -130,9 +130,10 @@ class Nile(BaseANN):
         Fetch the most recently created tenants from the tenants table.
         Populates self._tenant_ids with the most recent NUM_TENANTS tenant IDs.
         """
+        print(f"Fetching {self.NUM_TENANTS} existing tenants...")
         try:
             cur.execute(
-                "SELECT id FROM tenants ORDER BY created DESC LIMIT %s", (self.NUM_TENANTS,)
+                f"SELECT id FROM tenants ORDER BY created DESC LIMIT {self.NUM_TENANTS}"
             )
             rows = cur.fetchall()
             self._tenant_ids = [row[0] for row in rows]
@@ -280,7 +281,8 @@ class Nile(BaseANN):
             # Switch tenant context every 200 queries.
             if (self._query_count - 1) % 200 == 0:
                 tenant_id_to_set = random.choice(self._tenant_ids)
-                self._cur.execute(sql.SQL("commit; set nile.tenant_id = {}").format(sql.Literal(tenant_id_to_set)))
+                self._cur.execute("commit;")
+                self._cur.execute(f"set nile.tenant_id = '{tenant_id_to_set}'")
 
         query = sql.SQL(self._query).format(limit=sql.Literal(n))
         if self._insert_as_text:
