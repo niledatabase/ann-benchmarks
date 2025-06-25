@@ -43,7 +43,19 @@ class Nile(BaseANN):
     NUM_TENANTS = 50
     
     
-    def __init__(self, metric: str, connection_string: str, m: int, ef_construction: int, existing_table: bool = False, table_name: str = "items", is_tenant_aware: bool = True, insert_as_text: bool = False, num_tenants: int = 50, compute_id: str = None):
+    def __init__(
+        self,
+        metric: str,                    # required
+        connection_string: str,         # required
+        m: int,                         # required
+        ef_construction: int,           # required
+        existing_table: bool = False,
+        table_name: str = "items",
+        is_tenant_aware: bool = True,
+        insert_as_text: bool = False,
+        num_tenants: int = 50,
+        compute_id: str = None
+    ):
         """
         Initialize the Nile ANN class.
 
@@ -274,7 +286,8 @@ class Nile(BaseANN):
         self._cur.execute("SET hnsw.ef_search = %d" % ef_search)
         # using strict_order to avoid modifying the query and using CTE
         self._cur.execute("SET hnsw.iterative_scan = strict_order;")
-        self._cur.execute("SET hnsw.max_scan_tuples = 40000;")
+        self._cur.execute("SET hnsw.max_scan_tuples = 100000;")
+        self._cur.execute("SET hnsw.scan_mem_multiplier = 2;;")
 
     def query(self, v, n):
         if self.IS_TENANT_AWARE:
@@ -298,10 +311,18 @@ class Nile(BaseANN):
         return psutil.Process().memory_info().rss / 1024
 
     def __str__(self):
-        s = f"Nile(m={self._m}, ef_construction={self._ef_construction}, ef_search={self._ef_search}"
-        if self.IS_TENANT_AWARE:
-            s += f", tenants={self.NUM_TENANTS}"
-        if self._compute_id:
+        s = f"Nile(metric={self._metric}, connection_string={self._connection_string}, m={self._m}, ef_construction={self._ef_construction}"
+        if self._existing_table != False:
+            s += f", existing_table={self._existing_table}"
+        if self._table_name != "items":
+            s += f", table_name={self._table_name}"
+        if self.IS_TENANT_AWARE != True:
+            s += f", is_tenant_aware={self.IS_TENANT_AWARE}"
+        if self._insert_as_text != False:
+            s += f", insert_as_text={self._insert_as_text}"
+        if self.NUM_TENANTS != 50:
+            s += f", num_tenants={self.NUM_TENANTS}"
+        if self._compute_id is not None:
             s += f", compute_id={self._compute_id}"
         s += ")"
         return s
