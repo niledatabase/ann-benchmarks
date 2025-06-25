@@ -76,7 +76,7 @@ class Nile(BaseANN):
         self._m = m
         self._ef_construction = ef_construction
         self._existing_table = existing_table
-        self._ef_search = 40 # default, it can be overridden by the query arguments
+        self._ef_search = 256 # default, it can be overridden by the query arguments
         self._cur = None
         self._query_count = 0
         self._table_name = table_name
@@ -286,8 +286,8 @@ class Nile(BaseANN):
         self._cur.execute("SET hnsw.ef_search = %d" % ef_search)
         # using strict_order to avoid modifying the query and using CTE
         self._cur.execute("SET hnsw.iterative_scan = strict_order;")
-        self._cur.execute("SET hnsw.max_scan_tuples = 100000;")
-        self._cur.execute("SET hnsw.scan_mem_multiplier = 2;;")
+        self._cur.execute("SET hnsw.max_scan_tuples = 1000000;")
+        self._cur.execute("SET hnsw.scan_mem_multiplier = 4;")
 
     def query(self, v, n):
         if self.IS_TENANT_AWARE:
