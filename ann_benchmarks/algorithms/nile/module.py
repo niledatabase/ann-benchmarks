@@ -283,9 +283,9 @@ class Nile(BaseANN):
 
     def set_query_arguments(self, ef_search):
         self._ef_search = ef_search
-        self._cur.execute("SET hnsw.ef_search = %d" % ef_search)
+        self._cur.execute("SET hnsw.ef_search = %d" % ef_search, prepare=False)
         # using strict_order to avoid modifying the query and using CTE
-        self._cur.execute("SET hnsw.iterative_scan = strict_order;")
+        self._cur.execute("SET hnsw.iterative_scan = strict_order;", prepare=False)
 
     def query(self, v, n):
         if self.IS_TENANT_AWARE:
@@ -293,8 +293,8 @@ class Nile(BaseANN):
             # Switch tenant context every 200 queries.
             if (self._query_count - 1) % 200 == 0:
                 tenant_id_to_set = random.choice(self._tenant_ids)
-                self._cur.execute("commit;")
-                self._cur.execute(f"set nile.tenant_id = '{tenant_id_to_set}'")
+                self._cur.connection.commit()
+                self._cur.execute(f"set nile.tenant_id = '{tenant_id_to_set}'", prepare=False)
                 ## We need to set the query arguments again because it looks like sometimes these disappear from the session
                 self.set_query_arguments(self._ef_search)
 
